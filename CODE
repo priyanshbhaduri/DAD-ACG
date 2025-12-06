@@ -1,0 +1,295 @@
+/*
+ * Copyright (C) 2023 Priyansh Bhaduri <priyanshbhaduriuni@gmail.com>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+
+
+
+
+// -----------------------------------------------------------------------
+// Adaptive Communication Glove (ACG) - SOS Feature Added
+// -----------------------------------------------------------------------
+
+// --- Built-in Libraries ---
+#include <Wire.h>          
+#include <SoftwareSerial.h> 
+
+// --- Installed Libraries (MUST be installed) ---
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_MPU6050.h> 
+
+// --- Pin and Address Setup ---
+const int TRIG_FLEX_PIN = A0;   // Index Finger: Confirmation/Trigger
+const int MODE_A_FLEX_PIN = A1; // Middle Finger: Mode A (Needs)
+const int MODE_B_FLEX_PIN = A2; // Ring Finger: Mode B (Social/Utility)
+const int SOS_FLEX_PIN  = A3;   // Pinky Finger: SOS Trigger
+
+const int TTS_TX_PIN = 3;       
+const int TTS_RX_PIN = 2;       
+
+// --- Define specific objects using the libraries ---
+Adafruit_SSD1306 display(128, 64, &Wire, -1); 
+Adafruit_MPU6050 mpu;                          
+SoftwareSerial ttsSerial(TTS_RX_PIN, TTS_TX_PIN); 
+
+// --- Project Logic Definitions ---
+const int FLEX_THRESHOLD = 500; // Analog value threshold (Calibrate this!)
+const float ANGLE_TOLERANCE = 15.0; 
+
+// --- SOS Logic Variables ---
+int sos_press_count = 0;
+long last_sos_press_time = 0;
+const long SOS_TIMEOUT_MS = 5000; // 5 seconds window for 5 presses
+bool sos_was_pressed = false; // Debounce flag
+
+// --- Mode Enumeration ---
+enum GloveMode {
+  MODE_A_NEEDS,      
+  MODE_B_SOCIAL,     
+  MODE_DEFAULT       
+};
+
+// Define the structure for a preset sentence
+struct PresetSentence {
+  const char* text;
+  float targetX; 
+  float targetY; 
+};
+
+// --- SENTENCE ARRAYS (Same as before) ---
+
+// MODE A: NEEDS & ASSISTANCE
+PresetSentence mode_A_sentences[] = {
+  // Description:             Target X | Target Y 
+  {"I am hungry.",            85.0,     5.0},     
+  {"I am thirsty.",          -5.0,    -5.0},     
+  {"I need medication.",      -85.0,    5.0},     
+  {"I need to rest.",         -5.0,    -80.0},    
+};
+const int NUM_MODE_A = 4;
+
+// MODE B: SOCIAL & UTILITY
+PresetSentence mode_B_sentences[] = {
+  // Description:             Target X | Target Y 
+  {"Hello!",                  85.0,     5.0},     
+  {"Thank you.",              -5.0,    -5.0},     
+  {"Yes.",                    -85.0,    5.0},     
+  {"No.",                     -5.0,    -80.0},    
+};
+const int NUM_MODE_B = 4;
+
+// --- FUNCTION PROTOTYPES ---
+bool checkGestureMatch(const PresetSentence* currentModeSentences, int numSentences, float currentX, float currentY);
+void handleSosLogic();
+void speakPhrase(const char* phrase);
+void updateDisplayStatus(float x, float y, GloveMode mode);
+
+
+// -----------------------------------------------------------------------
+// SETUP FUNCTION
+// -----------------------------------------------------------------------
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+  ttsSerial.begin(9600); 
+  
+  // MPU-6050 and OLED Initialization (omitted checks for brevity)
+  mpu.begin();
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C); 
+  display.display();
+  delay(1000);
+  display.clearDisplay();
+}
+
+
+// -----------------------------------------------------------------------
+// MAIN LOOP FUNCTION
+// -----------------------------------------------------------------------
+void loop() {
+  // 0. CHECK FOR SOS EMERGENCY FIRST
+  handleSosLogic();
+  if (sos_press_count >= 5) {
+      // SOS ACTIVATED: Prioritize this message!
+      const char* sos_message = "EMERGENCY: I need help immediately!";
+      
+      display.clearDisplay();
+      display.setTextSize(2);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 20);
+      display.println("!! SOS !!");
+      display.display();
+      
+      speakPhrase(sos_message); 
+      
+      // Reset SOS counter and wait for the pinky finger to be released
+      sos_press_count = 0;
+      last_sos_press_time = 0;
+      while(analogRead(SOS_FLEX_PIN) > FLEX_THRESHOLD) {
+          delay(100);
+      }
+      delay(2000); // Give time for the phrase to complete
+      return; // Skip normal communication until next loop
+  }
+  
+  // 1. Normal Mode Logic (only runs if SOS is not active)
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp); 
+
+  float angleX = atan2(a.acceleration.y, a.acceleration.z) * 180 / PI;
+  float angleY = atan2(-a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z)) * 180 / PI;
+
+  // Read Flex Sensors
+  bool isTriggered = (analogRead(TRIG_FLEX_PIN) > FLEX_THRESHOLD);
+  bool modeAActive = (analogRead(MODE_A_FLEX_PIN) > FLEX_THRESHOLD);
+  bool modeBActive = (analogRead(MODE_B_FLEX_PIN) > FLEX_THRESHOLD);
+  
+  // 2. Determine the Active Mode
+  GloveMode currentMode = MODE_DEFAULT;
+  const PresetSentence* activeSentenceArray = nullptr;
+  int activeNumSentences = 0;
+  const char* modeName = "DEFAULT";
+
+  // Mode Selection Logic (same as before)
+  if (modeAActive && !modeBActive) {
+    currentMode = MODE_A_NEEDS;
+    activeSentenceArray = mode_A_sentences;
+    activeNumSentences = NUM_MODE_A;
+    modeName = "NEEDS MODE";
+  } else if (modeBActive && !modeAActive) {
+    currentMode = MODE_B_SOCIAL;
+    activeSentenceArray = mode_B_sentences;
+    activeNumSentences = NUM_MODE_B;
+    modeName = "SOCIAL MODE";
+  } else {
+    updateDisplayStatus(angleX, angleY, currentMode);
+    delay(50);
+    return;
+  }
+  
+  // 3. Gesture Check 
+  if (isTriggered) {
+    for (int i = 0; i < activeNumSentences; i++) { 
+      if (checkGestureMatch(activeSentenceArray, activeNumSentences, angleX, angleY)) {
+        
+        const char* phrase = activeSentenceArray[i].text;
+        
+        // Output: Display and Speak
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setCursor(0, 0);
+        display.print("MODE: "); display.println(modeName);
+        display.setTextSize(2);
+        display.setCursor(0, 20);
+        display.println(phrase);
+        display.display();
+        
+        speakPhrase(phrase); 
+        
+        // Wait for ALL triggers to be released
+        while(analogRead(TRIG_FLEX_PIN) > FLEX_THRESHOLD || 
+              analogRead(MODE_A_FLEX_PIN) > FLEX_THRESHOLD ||
+              analogRead(MODE_B_FLEX_PIN) > FLEX_THRESHOLD) {
+          delay(100);
+        }
+        delay(500); 
+        return; 
+      }
+    }
+  } else {
+    updateDisplayStatus(angleX, angleY, currentMode); 
+  }
+  
+  delay(50);
+}
+
+
+// -----------------------------------------------------------------------
+// SOS DEDICATED LOGIC FUNCTION
+// -----------------------------------------------------------------------
+void handleSosLogic() {
+  bool sos_current_state = (analogRead(SOS_FLEX_PIN) > FLEX_THRESHOLD);
+  
+  // 1. Check for time expiration
+  if (millis() - last_sos_press_time > SOS_TIMEOUT_MS) {
+    // If 5 seconds have passed since the last press, reset the count
+    sos_press_count = 0;
+  }
+  
+  // 2. Detect the press (HIGH-to-LOW transition logic)
+  if (sos_current_state && !sos_was_pressed) {
+    // Finger has just been pressed/bent
+    
+    // Increment the counter
+    sos_press_count++; 
+    Serial.print("SOS Press Count: "); 
+    Serial.println(sos_press_count);
+    
+    // Update the timer for the timeout window
+    last_sos_press_time = millis(); 
+  }
+  
+  // 3. Update the debounce state
+  sos_was_pressed = sos_current_state; 
+}
+
+
+// -----------------------------------------------------------------------
+// HELPER FUNCTIONS (Same as before)
+// -----------------------------------------------------------------------
+
+bool checkGestureMatch(const PresetSentence* currentModeSentences, int numSentences, float currentX, float currentY) {
+  for (int i = 0; i < numSentences; i++) {
+    if (abs(currentX - currentModeSentences[i].targetX) <= ANGLE_TOLERANCE &&
+        abs(currentY - currentModeSentences[i].targetY) <= ANGLE_TOLERANCE) {
+          return true;
+        }
+  }
+  return false;
+}
+
+void speakPhrase(const char* phrase) {
+  ttsSerial.print(phrase);
+  ttsSerial.write('\n'); 
+}
+
+void updateDisplayStatus(float x, float y, GloveMode mode) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  
+  display.setCursor(0, 0);
+  display.print("X (Pitch): "); display.println(x, 1);
+  display.setCursor(0, 10);
+  display.print("Y (Roll):  "); display.println(y, 1);
+  
+  display.setCursor(0, 30);
+  if (mode == MODE_A_NEEDS) {
+    display.println("MODE A: NEEDS");
+  } else if (mode == MODE_B_SOCIAL) {
+    display.println("MODE B: SOCIAL");
+  } else {
+    display.println("SELECT MODE: Middle/Ring");
+  }
+  
+  display.setCursor(0, 45);
+  display.print("SOS Count: "); display.println(sos_press_count);
+  
+  display.display();
+}

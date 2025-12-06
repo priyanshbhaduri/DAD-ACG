@@ -1,0 +1,5 @@
+To run the code install the Arduino Libraries
+
+https://github.com/adafruit/Adafruit-GFX-Library.git
+https://github.com/adafruit/Adafruit_SSD1306.git
+https://github.com/adafruit/Adafruit_MPU6050.git
